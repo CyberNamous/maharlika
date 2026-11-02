@@ -5,6 +5,7 @@ const SITE = (process.env.SITE_URL || 'https://pinoylegends.cybernamous.workers.
 const INVITE = process.env.DISCORD_INVITE || 'Not set yet';
 const ALERT_CHANNEL = process.env.ALERT_CHANNEL_ID;       // staff channel: down/up alerts
 const ANNOUNCE_CHANNEL = process.env.ANNOUNCE_CHANNEL_ID; // public channel: new posts/heroes
+const STATUS_CHANNEL = process.env.STATUS_CHANNEL_ID;       // read-only channel with the live card
 const CHECK_EVERY = 2 * 60 * 1000;                        // check the site every 2 minutes
 const startedAt = Date.now();
 
@@ -12,7 +13,14 @@ const startedAt = Date.now();
 http.createServer((req, res) => { res.writeHead(200); res.end('ok'); })
   .listen(process.env.PORT || 3000);
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMembers,   // privileged: lets the bot tell members from bots
+    GatewayIntentBits.GuildPresences, // privileged: online / idle / dnd counts only
+  ],
+});
 
 const commands = [
   { name: 'ping', description: 'Check if Maharlika is alive' },
@@ -28,6 +36,8 @@ let lastVersion = null;   // content version from /api/public
 let seenPosts = null;     // Set of post ids
 let seenHeroes = null;    // Set of hero ids
 let downSince = null;
+let siteMs = null;        // last response time in ms
+let recoveredAt = 0;      // when the site last came back
 
 async function sendTo(channelId, payload) {
   if (!channelId) return;
@@ -43,7 +53,9 @@ async function checkSite() {
   let up = false, data = null;
   try {
     const url = SITE + '/api/public' + (lastVersion ? `?version=${encodeURIComponent(lastVersion)}` : '');
+    const t0 = Date.now();
     const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    siteMs = Date.now() - t0;
     up = r.ok;
     if (r.ok) data = await r.json();
   } catch { up = false; }
@@ -61,8 +73,10 @@ async function checkSite() {
       downSince = null;
     }
   }
+  const changed = siteUp !== up;
+  if (up && siteUp === false) recoveredAt = Date.now();
   siteUp = up;
-  updatePresence();
+  if (changed) refresh();
 
   // content changes
   if (!up || !data) return;
@@ -154,21 +168,131 @@ const pools = {
   ],
 };
 
+let currentLine = 'Getting ready…';
+let lastPick = null;
+
+function describe(a) {
+  if (a.type === ActivityType.Custom) return a.state;
+  const verb = {
+    [ActivityType.Playing]: 'Playing',
+    [ActivityType.Watching]: 'Watching',
+    [ActivityType.Listening]: 'Listening to',
+    [ActivityType.Competing]: 'Competing',
+  }[a.type] || '';
+  return `${verb} ${a.name}`.trim();
+}
+
 function updatePresence() {
   if (!client.user) return;
 
   if (siteUp === false) {
-    return client.user.setPresence({
-      status: 'dnd',
-      activities: [A(ActivityType.Watching, 'Website is down')],
-    });
+    const down = A(ActivityType.Watching, 'Website is down');
+    currentLine = describe(down);
+    return client.user.setPresence({ status: 'dnd', activities: [down] });
   }
   const p = period();
   const pool = pools[p];
+  let pick;
+  do { pick = pool[Math.floor(Math.random() * pool.length)]; } while (pool.length > 1 && pick === lastPick);
+  lastPick = pick;
+  currentLine = describe(pick);
   client.user.setPresence({
     status: p === 'sleep' ? 'idle' : p === 'lunch' ? 'dnd' : 'online',
-    activities: [pool[n++ % pool.length]],
+    activities: [pick],
   });
+}
+
+// ---------- mood ----------
+function mood() {
+  const t = manilaMinutes();
+  if (siteUp === false) return { key: 'worried', emoji: '😰', text: 'Worried, the website is not responding', color: 0xe74c3c };
+  if (recoveredAt && Date.now() - recoveredAt < 10 * 60000) return { key: 'relieved', emoji: '😮‍💨', text: 'Relieved, the website is back', color: 0x2ecc71 };
+  if (t > 21 * 60 || t < 7 * 60) return { key: 'sleeping', emoji: '😴', text: 'Sleeping, please do not wake me', color: 0x6b7280 };
+  if (t < 11 * 60) return { key: 'energetic', emoji: '☀️', text: 'Energetic and ready for the day', color: 0x2ecc71 };
+  if (t < 12 * 60) return { key: 'hungry', emoji: '🍚', text: 'Hungry, lunch break has started', color: 0xf5b82e };
+  if (t < 13 * 60) return { key: 'full', emoji: '😋', text: 'Full and happy after lunch', color: 0xf5b82e };
+  if (t < 15 * 60) return { key: 'sleepy', emoji: '🥱', text: 'A little sleepy after lunch', color: 0x2ecc71 };
+  if (t < 16 * 60) return { key: 'merienda', emoji: '🍢', text: 'Happy, it is merienda time', color: 0xf5b82e };
+  return { key: 'focused', emoji: '⚔️', text: 'Focused on the battlefield', color: 0x2ecc71 };
+}
+
+// ---------- member stats (counts only, never names) ----------
+const getGuild = () => (process.env.GUILD_ID && client.guilds.cache.get(process.env.GUILD_ID)) || client.guilds.cache.first();
+const manilaDate = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(new Date());
+let peakDay = null, peakActive = 0;
+
+async function memberStats() {
+  const g = getGuild();
+  if (!g) return null;
+  if (g.members.cache.size < g.memberCount) await g.members.fetch().catch(e => console.error('member fetch failed:', e.message));
+  let total = 0, online = 0, idle = 0, dnd = 0;
+  for (const m of g.members.cache.values()) {
+    if (m.user.bot) continue;            // members only, no bots
+    total++;
+    const st = m.presence?.status;       // counted, then discarded
+    if (st === 'online') online++;
+    else if (st === 'idle') idle++;
+    else if (st === 'dnd') dnd++;
+  }
+  const active = online + idle + dnd;
+  const today = manilaDate();
+  if (peakDay !== today) { peakDay = today; peakActive = 0; }
+  if (active > peakActive) peakActive = active;
+  return { total, online, idle, dnd, active, peak: peakActive };
+}
+
+// ---------- live card (one message, edited in place) ----------
+let cardId = null;
+
+async function updateCard() {
+  if (!STATUS_CHANNEL || !client.user) return;
+  try {
+    const ch = await client.channels.fetch(STATUS_CHANNEL);
+    if (!ch || !ch.isTextBased()) return;
+    const m = mood();
+    const st = await memberStats();
+    const embed = new EmbedBuilder()
+      .setTitle('Maharlika · Live Status')
+      .setColor(m.color)
+      .addFields(
+        { name: 'Website connection', value: siteUp === false ? '🔴 Not responding' : siteUp ? `🟢 Connected · ${siteMs} ms` : '⏳ Checking…' },
+        { name: 'Mood', value: `${m.emoji} ${m.text}\n*${currentLine}*` },
+        {
+          name: 'Members',
+          value: st
+            ? `👥 ${st.total.toLocaleString('en-US')} total\n🟢 ${st.online} online · 🌙 ${st.idle} idle · ⛔ ${st.dnd} DND\n📈 Peak active today: ${st.peak}`
+            : '–',
+        },
+      )
+      .setFooter({ text: 'Updates every few minutes' })
+      .setTimestamp();
+
+    let msg = null;
+    if (cardId) msg = await ch.messages.fetch(cardId).catch(() => null);
+    if (!msg) {
+      const recent = await ch.messages.fetch({ limit: 50 }).catch(() => null);
+      msg = (recent && recent.find(x => x.author.id === client.user.id && x.embeds[0]?.title?.startsWith('Maharlika'))) || null;
+    }
+    if (msg) { cardId = msg.id; await msg.edit({ embeds: [embed] }); }
+    else { const sent = await ch.send({ embeds: [embed] }); cardId = sent.id; }
+  } catch (e) { console.error('card failed:', e.message); }
+}
+
+// ---------- scheduler: random 2-5 minutes, instant on mood/site changes ----------
+let lastMood = null;
+
+async function refresh() {
+  updatePresence();
+  await updateCard();
+}
+
+function startScheduler() {
+  const next = () => setTimeout(async () => { await refresh(); next(); }, (2 + Math.random() * 3) * 60000);
+  next();
+  setInterval(() => {
+    const k = mood().key;
+    if (k !== lastMood) { lastMood = k; refresh(); }
+  }, 30000);
 }
 
 function fmtUptime(ms) {
@@ -179,9 +303,13 @@ function fmtUptime(ms) {
 client.once(Events.ClientReady, async () => {
   const guild = process.env.GUILD_ID && client.guilds.cache.get(process.env.GUILD_ID);
   await (guild ? guild.commands.set(commands) : client.application.commands.set(commands));
+  const g0 = getGuild();
+  if (g0) await g0.members.fetch().catch(e => console.error('member fetch failed:', e.message));
   await checkSite();
   setInterval(checkSite, CHECK_EVERY);
-  setInterval(updatePresence, 30000);
+  lastMood = mood().key;
+  await refresh();
+  startScheduler();
   console.log(`Online as ${client.user.tag}`);
 });
 
