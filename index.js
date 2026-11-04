@@ -36,6 +36,8 @@ let lastVersion = null;   // content version from /api/public
 let seenPosts = null;     // Set of post ids
 let seenHeroes = null;    // Set of hero ids
 let downSince = null;
+let maintPhase = null;     // off | scheduled | notice | active (from /api/maintenance)
+let lastScheduled = null;  // start time of the last maintenance we announced
 let siteMs = null;        // last response time in ms
 let recoveredAt = 0;      // when the site last came back
 
@@ -60,6 +62,40 @@ async function checkSite() {
     if (r.ok) data = await r.json();
   } catch { up = false; }
 
+  // maintenance state + announcements
+  let phaseChanged = false;
+  try {
+    const r2 = await fetch(SITE + '/api/maintenance', { signal: AbortSignal.timeout(8000) });
+    if (r2.ok) {
+      const mt = await r2.json();
+      const prev = maintPhase;
+      phaseChanged = prev !== mt.phase;
+      maintPhase = mt.phase;
+      const ts = (iso) => Math.floor(Date.parse(iso) / 1000);
+      if (prev !== null) {
+        if (mt.phase === 'active' && prev !== 'active') {
+          await sendTo(ANNOUNCE_CHANNEL, { embeds: [new EmbedBuilder().setColor(0xf5b82e)
+            .setTitle('🛠️ Maintenance has started')
+            .setDescription('The website is temporarily closed.' + (mt.end ? ` Expected back <t:${ts(mt.end)}:R>.` : ''))
+            .setTimestamp()] });
+        } else if (prev === 'active' && mt.phase !== 'active') {
+          await sendTo(ANNOUNCE_CHANNEL, { embeds: [new EmbedBuilder().setColor(0x2ecc71)
+            .setTitle("✅ We're back!").setDescription('Maintenance is over and the website is open again.').setTimestamp()] });
+        }
+      }
+      const upcoming = mt.phase === 'scheduled' || mt.phase === 'notice' ? mt.start : null;
+      if (upcoming !== lastScheduled) {
+        if (prev !== null && upcoming) {
+          await sendTo(ANNOUNCE_CHANNEL, { embeds: [new EmbedBuilder().setColor(0xf5b82e)
+            .setTitle('🛠️ Scheduled maintenance')
+            .setDescription(`Starts <t:${ts(upcoming)}:F> (<t:${ts(upcoming)}:R>)` + (mt.end ? `, expected to end <t:${ts(mt.end)}:F>.` : '.'))
+            .setTimestamp()] });
+        }
+        lastScheduled = upcoming;
+      }
+    }
+  } catch { /* keep the last known state */ }
+
   // up/down transitions
   if (siteUp !== null && up !== siteUp) {
     if (!up) {
@@ -73,7 +109,7 @@ async function checkSite() {
       downSince = null;
     }
   }
-  const changed = siteUp !== up;
+  const changed = siteUp !== up || phaseChanged;
   if (up && siteUp === false) recoveredAt = Date.now();
   siteUp = up;
   if (changed) refresh();
@@ -185,6 +221,11 @@ function describe(a) {
 function updatePresence() {
   if (!client.user) return;
 
+  if (maintPhase === 'active') {
+    const c = C('Under maintenance 🛠️');
+    currentLine = describe(c);
+    return client.user.setPresence({ status: 'dnd', activities: [c] });
+  }
   if (siteUp === false) {
     const down = A(ActivityType.Watching, 'Website is down');
     currentLine = describe(down);
@@ -205,6 +246,7 @@ function updatePresence() {
 // ---------- mood ----------
 function mood() {
   const t = manilaMinutes();
+  if (maintPhase === 'active') return { key: 'maintenance', emoji: '🛠️', text: 'Under maintenance, back soon', color: 0xf5b82e };
   if (siteUp === false) return { key: 'worried', emoji: '😰', text: 'Worried, the website is not responding', color: 0xe74c3c };
   if (recoveredAt && Date.now() - recoveredAt < 10 * 60000) return { key: 'relieved', emoji: '😮‍💨', text: 'Relieved, the website is back', color: 0x2ecc71 };
   if (t > 21 * 60 || t < 7 * 60) return { key: 'sleeping', emoji: '😴', text: 'Sleeping, please do not wake me', color: 0x6b7280 };
@@ -255,7 +297,7 @@ async function updateCard() {
       .setTitle('Maharlika · Live Status')
       .setColor(m.color)
       .addFields(
-        { name: 'Website connection', value: siteUp === false ? '🔴 Not responding' : siteUp ? `🟢 Connected · ${siteMs} ms` : '⏳ Checking…' },
+        { name: 'Website connection', value: maintPhase === 'active' ? '🛠️ Under maintenance' : siteUp === false ? '🔴 Not responding' : siteUp ? `🟢 Connected · ${siteMs} ms` : '⏳ Checking…' },
         { name: 'Mood', value: `${m.emoji} ${m.text}\n*${currentLine}*` },
         {
           name: 'Members',
@@ -399,10 +441,15 @@ client.on(Events.InteractionCreate, async (i) => {
         const r = await fetch(SITE + '/', { signal: AbortSignal.timeout(8000) });
         ok = r.ok; code = r.status;
       } catch {}
+      let maint = false;
+      try {
+        const r2 = await fetch(SITE + '/api/maintenance', { signal: AbortSignal.timeout(8000) });
+        if (r2.ok) maint = (await r2.json()).phase === 'active';
+      } catch {}
       const embed = new EmbedBuilder()
         .setTitle('Pinoy Legends Website')
-        .setColor(ok ? 0x2ecc71 : 0xe74c3c)
-        .setDescription(ok ? '🟢 Online' : '🔴 Not responding')
+        .setColor(maint ? 0xf5b82e : ok ? 0x2ecc71 : 0xe74c3c)
+        .setDescription(maint ? '🛠️ Under maintenance' : ok ? '🟢 Online' : '🔴 Not responding')
         .addFields(
           { name: 'Response', value: `${Date.now() - start} ms`, inline: true },
           { name: 'HTTP status', value: String(code), inline: true },
