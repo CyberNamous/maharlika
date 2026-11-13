@@ -129,6 +129,9 @@ async function checkSite() {
         .setFooter({ text: p.kind === 'developer' ? 'Developer update' : 'Official announcement' })
         .setTimestamp(new Date(p.created_at));
       if (p.image_key) embed.setImage(SITE + '/media/' + p.image_key);
+      if (p.author_name && /^PL\d{12}$/.test(p.author_uid || '')) {
+        embed.setAuthor({ name: clip(`${p.author_name} · ${p.author_label || 'Team'}`, 120), iconURL: `${SITE}/team-avatar/${p.author_uid}`, url: `${SITE}/team/${p.author_uid}` });
+      }
       await sendTo(ANNOUNCE_CHANNEL, { embeds: [embed] });
     }
     for (const h of heroes.filter(h => !seenHeroes.has(h.id))) {
